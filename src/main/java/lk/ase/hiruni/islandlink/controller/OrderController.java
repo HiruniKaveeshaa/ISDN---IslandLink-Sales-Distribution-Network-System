@@ -1,0 +1,426 @@
+package lk.ase.kavinda.islandlink.controller;
+
+import lk.ase.kavinda.islandlink.dto.OrderDTO;
+import lk.ase.kavinda.islandlink.dto.OrderVerificationDTO;
+import lk.ase.kavinda.islandlink.dto.OrderVerificationRequest;
+import lk.ase.kavinda.islandlink.entity.Order;
+import lk.ase.kavinda.islandlink.entity.OrderItem;
+import lk.ase.kavinda.islandlink.entity.Product;
+import lk.ase.kavinda.islandlink.entity.Invoice;
+import lk.ase.kavinda.islandlink.entity.Payment;
+import lk.ase.kavinda.islandlink.service.OrderService;
+import lk.ase.kavinda.islandlink.service.InvoiceService;
+import lk.ase.kavinda.islandlink.service.PaymentService;
+import lk.ase.kavinda.islandlink.service.FinancialService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/api/orders")
+@CrossOrigin(origins = "http://localhost:4200")
+public class OrderController {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Autowired
+    private InvoiceService invoiceService;
+
+    @Autowired
+    private PaymentService paymentService;
+
+    @Autowired
+    private FinancialService financialService;
+
+    @PostMapping
+    public ResponseEntity<?> createOrder(@RequestBody CreateOrderRequest request) {
+        try {
+            System.out.println("Creating order for customer: " + request.getCustomerId());
+            System.out.println("Items count: " + request.getItems().size());
+            
+            List<OrderService.CreateOrderItemDTO> items = request.getItems().stream()
+                    .map(item -> new OrderService.CreateOrderItemDTO(item.getProductId(), item.getQuantity()))
+                    .collect(java.util.stream.Collectors.toList());
+                    
+            Order order = orderService.createOrder(
+                request.getCustomerId(),
+                request.getRdcLocation(),
+                request.getDeliveryAddress(),
+                request.getEstimatedDeliveryDays(),
+                request.getCustomerPhone(),
+                request.getStoreName(),
+                items
+            );
+            
+            String orderCode = order.getOrderCode() != null ? order.getOrderCode() : "ORD-" + order.getId();
+            
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "message", "Order placed successfully! Order Code: " + orderCode,
+                "order", orderCode
+            ));
+        } catch (RuntimeException e) {
+            System.out.println("Error creating order: " + e.getMessage());
+            e.printStackTrace();
+            return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "message", "Failed to create order: " + e.getMessage()
+            ));
+        }
+    }
+
+    @GetMapping
+    @PreAuthorize("hasRole('HEAD_OFFICE_MANAGER')")
+    public List<OrderDTO> getAllOrders() {
+        return orderService.getAllOrders().stream()
+                .map(OrderDTO::new)
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/customer/{customerId}")
+    @PreAuthorize("hasRole('RETAILER') or hasRole('HEAD_OFFICE_MANAGER')")
+    public List<OrderDTO> getOrdersByCustomer(@PathVariable Long customerId) {
+        try {
+            return orderService.getOrdersByCustomer(customerId).stream()
+                    .map(order -> {
+                        try {
+                            return new OrderDTO(order);
+                        } catch (Exception e) {
+                            System.err.println("Error converting order to DTO: " + e.getMessage());
+                            return null;
+                        }
+                    })
+                    .filter(dto -> dto != null)
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            System.err.println("Error getting orders for customer " + customerId + ": " + e.getMessage());
+            e.printStackTrace();
+            return List.of();
+        }
+    }
+
+    @GetMapping("/rdc/{rdcLocation}")
+    @PreAuthorize("hasRole('RDC_STAFF') or hasRole('HEAD_OFFICE_MANAGER')")
+    public List<OrderDTO> getOrdersByRdc(@PathVariable String rdcLocation) {
+        return orderService.getOrdersByRdc(rdcLocation).stream()
+                .map(OrderDTO::new)
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/status/{status}")
+    @PreAuthorize("hasRole('RDC_STAFF') or hasRole('LOGISTICS') or hasRole('HEAD_OFFICE_MANAGER')")
+    public List<OrderDTO> getOrdersByStatus(@PathVariable Order.OrderStatus status) {
+        return orderService.getOrdersByStatus(status).stream()
+                .map(OrderDTO::new)
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/unassigned-with-picklist")
+    @PreAuthorize("hasRole('LOGISTICS') or hasRole('HEAD_OFFICE_MANAGER')")
+    public List<OrderDTO> getUnassignedOrdersWithPicklist() {
+        return orderService.getOrdersByStatus(Order.OrderStatus.PICK_LIST_CREATED).stream()
+                .filter(order -> order.getDeliveryRoute() == null)
+                .map(OrderDTO::new)
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<OrderDTO> getOrderById(@PathVariable Long id) {
+        return orderService.getOrderById(id)
+                .map(order -> ResponseEntity.ok(new OrderDTO(order)))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}/status")
+    @PreAuthorize("hasRole('RDC_STAFF') or hasRole('LOGISTICS') or hasRole('HEAD_OFFICE_MANAGER')")
+    public ResponseEntity<Order> updateOrderStatus(@PathVariable Long id, @RequestParam Order.OrderStatus status) {
+        try {
+            Order updatedOrder = orderService.updateOrderStatus(id, status);
+            return ResponseEntity.ok(updatedOrder);
+        } catch (RuntimeException e) {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
+    @PutMapping("/{id}/modify")
+    @PreAuthorize("hasRole('RETAILER') or hasRole('HEAD_OFFICE_MANAGER')")
+    public ResponseEntity<?> modifyOrder(@PathVariable Long id, @RequestBody ModifyOrderRequest request) {
+        try {
+            List<OrderService.CreateOrderItemDTO> items = request.getItems().stream()
+                    .map(item -> new OrderService.CreateOrderItemDTO(item.getProductId(), item.getQuantity()))
+                    .collect(java.util.stream.Collectors.toList());
+            Order order = orderService.modifyOrder(id, items);
+            return ResponseEntity.ok(order);
+        } catch (RuntimeException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
+
+    @GetMapping("/recent")
+    public List<OrderDTO> getRecentOrders(@RequestParam(defaultValue = "7") int days) {
+        return orderService.getRecentOrders(days).stream()
+                .map(OrderDTO::new)
+                .collect(Collectors.toList());
+    }
+
+    @GetMapping("/rdc-id/{rdcId}")
+    public ResponseEntity<List<OrderDTO>> getOrdersByRdcId(@PathVariable Long rdcId) {
+        List<Order> orders = orderService.getOrdersByRdcId(rdcId);
+        List<OrderDTO> orderDTOs = orders.stream()
+                .map(this::convertToDTO)
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(orderDTOs);
+    }
+
+    @GetMapping("/pending-verification")
+    @PreAuthorize("hasRole('RDC_STAFF')")
+    public ResponseEntity<List<OrderVerificationDTO>> getPendingOrders(@RequestParam Long rdcId) {
+        return ResponseEntity.ok(orderService.getPendingOrdersForVerification(rdcId));
+    }
+
+    @PostMapping("/verify")
+    @PreAuthorize("hasRole('RDC_STAFF')")
+    public ResponseEntity<String> verifyOrder(@RequestBody OrderVerificationRequest request) {
+        String result = orderService.processOrderVerification(request);
+        return ResponseEntity.ok(result);
+    }
+
+    @GetMapping("/verification-details/{orderId}")
+    @PreAuthorize("hasRole('RDC_STAFF')")
+    public ResponseEntity<OrderVerificationDTO> getOrderVerificationDetails(@PathVariable Long orderId) {
+        return ResponseEntity.ok(orderService.getOrderVerificationDetails(orderId));
+    }
+
+    @DeleteMapping("/{id}/cancel")
+    @PreAuthorize("hasRole('RETAILER') or hasRole('HEAD_OFFICE_MANAGER')")
+    public ResponseEntity<?> cancelOrder(@PathVariable Long id) {
+        try {
+            orderService.cancelOrder(id);
+            return ResponseEntity.ok("Order cancelled successfully");
+        } catch (RuntimeException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
+
+    @PostMapping("/{id}/approve")
+    @PreAuthorize("hasRole('RDC_STAFF')")
+    public ResponseEntity<?> approveOrder(@PathVariable Long id, @RequestBody ApproveOrderRequest request) {
+        try {
+            Order order = orderService.approveOrder(id, request.getRdcId(), request.getStaffUserId());
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "message", "Order approved successfully",
+                "order", order
+            ));
+        } catch (RuntimeException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "message", e.getMessage()
+            ));
+        }
+    }
+
+    @PostMapping("/{id}/reject")
+    @PreAuthorize("hasRole('RDC_STAFF')")
+    public ResponseEntity<?> rejectOrder(@PathVariable Long id, @RequestBody RejectOrderRequest request) {
+        try {
+            Order order = orderService.rejectOrder(id, request.getRejectionReason(), request.getStaffUserId());
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "message", "Order rejected successfully",
+                "order", order
+            ));
+        } catch (RuntimeException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "message", e.getMessage()
+            ));
+        }
+    }
+
+    // DTO classes
+    public static class CreateOrderRequest {
+        private Long customerId;
+        private String rdcLocation;
+        private String deliveryAddress;
+        private Integer estimatedDeliveryDays;
+        private String customerPhone;
+        private String storeName;
+        private List<OrderItemRequest> items;
+
+        // Getters and setters
+        public Long getCustomerId() { return customerId; }
+        public void setCustomerId(Long customerId) { this.customerId = customerId; }
+        public String getRdcLocation() { return rdcLocation; }
+        public void setRdcLocation(String rdcLocation) { this.rdcLocation = rdcLocation; }
+        public String getDeliveryAddress() { return deliveryAddress; }
+        public void setDeliveryAddress(String deliveryAddress) { this.deliveryAddress = deliveryAddress; }
+        public Integer getEstimatedDeliveryDays() { return estimatedDeliveryDays; }
+        public void setEstimatedDeliveryDays(Integer estimatedDeliveryDays) { this.estimatedDeliveryDays = estimatedDeliveryDays; }
+        public String getCustomerPhone() { return customerPhone; }
+        public void setCustomerPhone(String customerPhone) { this.customerPhone = customerPhone; }
+        public String getStoreName() { return storeName; }
+        public void setStoreName(String storeName) { this.storeName = storeName; }
+        public List<OrderItemRequest> getItems() { return items; }
+        public void setItems(List<OrderItemRequest> items) { this.items = items; }
+    }
+
+    public static class OrderItemRequest {
+        private Long productId;
+        private Integer quantity;
+
+        // Getters and setters
+        public Long getProductId() { return productId; }
+        public void setProductId(Long productId) { this.productId = productId; }
+        public Integer getQuantity() { return quantity; }
+        public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    }
+
+    public static class ModifyOrderRequest {
+        private List<OrderItemRequest> items;
+
+        public List<OrderItemRequest> getItems() { return items; }
+        public void setItems(List<OrderItemRequest> items) { this.items = items; }
+    }
+
+    public static class ApproveOrderRequest {
+        private Long rdcId;
+        private Long staffUserId;
+
+        public Long getRdcId() { return rdcId; }
+        public void setRdcId(Long rdcId) { this.rdcId = rdcId; }
+        public Long getStaffUserId() { return staffUserId; }
+        public void setStaffUserId(Long staffUserId) { this.staffUserId = staffUserId; }
+    }
+
+    public static class RejectOrderRequest {
+        private String rejectionReason;
+        private Long staffUserId;
+
+        public String getRejectionReason() { return rejectionReason; }
+        public void setRejectionReason(String rejectionReason) { this.rejectionReason = rejectionReason; }
+        public Long getStaffUserId() { return staffUserId; }
+        public void setStaffUserId(Long staffUserId) { this.staffUserId = staffUserId; }
+    }
+
+    private OrderDTO convertToDTO(Order order) {
+        OrderDTO dto = new OrderDTO();
+        dto.setId(order.getId());
+        dto.setOrderCode(order.getOrderCode());
+        dto.setCustomerName(order.getCustomer().getBusinessName());
+        dto.setTotalAmount(order.getTotalAmount());
+        dto.setStatus(order.getStatus().toString());
+        dto.setOrderDate(order.getOrderDate());
+        dto.setRejectionReason(order.getRejectionReason());
+        return dto;
+    }
+
+    @PostMapping("/{orderId}/deliver")
+    @PreAuthorize("hasRole('LOGISTICS')")
+    public ResponseEntity<?> confirmDelivery(@PathVariable Long orderId, @RequestBody DeliveryConfirmationRequest request) {
+        try {
+            Order order = orderService.getOrderById(orderId)
+                    .orElseThrow(() -> new RuntimeException("Order not found"));
+
+            if (order.getStatus() != Order.OrderStatus.OUT_FOR_DELIVERY) {
+                return ResponseEntity.badRequest().body(Map.of("success", false, "message", "Order is not out for delivery"));
+            }
+
+            // Update order status to DELIVERED
+            orderService.updateOrderStatus(orderId, Order.OrderStatus.DELIVERED);
+            
+            // Generate invoice automatically
+            Invoice invoice = invoiceService.generateInvoice(orderId);
+            
+            // Record payment if provided
+            if (request.getAmountReceived() != null && request.getAmountReceived() > 0) {
+                Payment payment = paymentService.recordPayment(
+                    orderId, 
+                    BigDecimal.valueOf(request.getAmountReceived()),
+                    request.getPaymentMethod() != null ? request.getPaymentMethod() : "CASH"
+                );
+                
+                // Mark invoice as paid
+                invoiceService.markAsPaid(invoice.getId(), request.getPaymentMethod(), payment.getTransactionId());
+                
+                // Record payment in financial ledger
+                financialService.recordPaymentReceived(order, BigDecimal.valueOf(request.getAmountReceived()), request.getPaymentMethod());
+            }
+            
+            // Record sale transaction in ledger
+            financialService.recordSaleTransaction(order);
+            
+            return ResponseEntity.ok(Map.of(
+                "success", true, 
+                "message", "Delivery confirmed",
+                "invoiceNumber", invoice.getInvoiceNumber(),
+                "totalAmount", invoice.getTotalAmount()
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    @PostMapping("/{orderId}/issue")
+    @PreAuthorize("hasRole('LOGISTICS')")
+    public ResponseEntity<?> reportIssue(@PathVariable Long orderId, @RequestBody UpdateAddressRequest.DeliveryIssueRequest request) {
+        try {
+            return ResponseEntity.ok(Map.of("success", true, "message", "Issue reported"));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    public static class DeliveryConfirmationRequest {
+        private String paymentMethod;
+        private Double amountReceived;
+        private String notes;
+
+        public String getPaymentMethod() { return paymentMethod; }
+        public void setPaymentMethod(String paymentMethod) { this.paymentMethod = paymentMethod; }
+        public Double getAmountReceived() { return amountReceived; }
+        public void setAmountReceived(Double amountReceived) { this.amountReceived = amountReceived; }
+        public String getNotes() { return notes; }
+        public void setNotes(String notes) { this.notes = notes; }
+    }
+
+    @PutMapping("/{orderId}/delivery-address")
+    @PreAuthorize("hasRole('LOGISTICS') or hasRole('HEAD_OFFICE_MANAGER')")
+    public ResponseEntity<?> updateDeliveryAddress(@PathVariable Long orderId, @RequestBody UpdateAddressRequest request) {
+        try {
+            Order order = orderService.getOrderById(orderId)
+                    .orElseThrow(() -> new RuntimeException("Order not found"));
+            
+            order.setDeliveryAddress(request.getDeliveryAddress());
+            orderService.updateOrder(order);
+            
+            return ResponseEntity.ok(Map.of("success", true, "message", "Delivery address updated"));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        }
+    }
+
+    public static class UpdateAddressRequest {
+        private String deliveryAddress;
+        
+        public String getDeliveryAddress() { return deliveryAddress; }
+        public void setDeliveryAddress(String deliveryAddress) { this.deliveryAddress = deliveryAddress; }
+        
+        public static class DeliveryIssueRequest {
+            private String issueType;
+            private String issueNotes;
+
+            public String getIssueType() { return issueType; }
+            public void setIssueType(String issueType) { this.issueType = issueType; }
+            public String getIssueNotes() { return issueNotes; }
+            public void setIssueNotes(String issueNotes) { this.issueNotes = issueNotes; }
+        }
+    }
+}
